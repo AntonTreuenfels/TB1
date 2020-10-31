@@ -1,0 +1,111 @@
+; MOS 6551 ACIA control
+
+; INCLUDE this file to use its definitions
+; - assign a base address for the chip to ]ioBase before including
+; (variable label can be used for more than one periphiral chip)
+
+; first created: 08/14/20
+; last revision: 08/17/20
+
+; 'ioBase' is externally supplied
+
+; register selects depend on low two bits of address
+
+		if ]ioBase & %11 != 0
+		fatal "low two bits of ]ioBase must be zero"
+		endif
+		
+; 6551 registers
+
+ACIA_iobuff	equ ]ioBase		; transmit/receive buffer
+ACIA_status	equ ]ioBase+1	; status
+ACIA_cmnd	equ ]ioBase+2	; command
+ACIA_ctrl	equ ]ioBase+3	; control
+
+; control register
+
+; stop bits
+
+stop_one	equ %00000000	; one stop bit
+stop_two	equ %10000000	; two stop bits
+							; one stop bit if word length = 8 and parity
+							; one-and-a-half stop bits if word length = 5 and no parity
+							
+; word length
+
+char_bits8	equ %00000000	; eight bits
+char_bits7	equ %00100000	; seven bits
+char_bits6	equ %01000000	; six bits
+char_bits5	equ %01100000	; five bits
+
+; baud rate clock source
+
+clck_extrnl	equ %00000000	; external
+clck_intrnl equ %00010000	; internal
+
+; baud rate
+
+baud_clk16	equ %00000000	; 16 * external clock
+baud_00050	equ %00000001	; 50 baud
+baud_00075	equ %00000010	; 75 baud
+baud_00110	equ %00000011	; 109.92 baud
+baud_00135	equ %00000100	; 134.58 baud
+baud_00150	equ %00000101	; 150 baud
+baud_00300	equ %00000110	; 300 baud
+baud_00600	equ %00000111	; 600 baud
+baud_01200	equ %00001000	; 1200 baud
+baud_01800	equ %00001001	; 1800 baud
+baud_02400	equ %00001010	; 2400 baud
+baud_03600	equ %00001011	; 3600 baud
+baud_04800	equ %00001100	; 4800 baud
+baud_07200	equ %00001101	; 7200 baud
+baud_09600	equ %00001110	; 9600 baud
+baud_19200	equ %00001111	; 19200 baud
+
+; command register
+
+; parity - applies to both transmit and recive
+
+prty_none	equ %00000000	; none (bits 6 and 7 = "don't care")
+prty_odd	equ %00100000	; odd
+prty_even	equ %01100000	; even
+prty_mark	equ %10100000	; mark transmitted, no receive check
+prty_spc	equ %11100000	; space transmitted, no receive check
+
+; normal / echo
+
+echo_off	equ %00000000	; normal
+echo_on		equ %00010000	; echo
+
+; transmit interrupt
+
+txi_offHio	equ %00000000	; disabled, RTS high
+txi_onLo	equ %00000100	; enabled, RTS low
+txi_offLo	equ %00001000	; disabled, RTS low
+txi_break	equ %00001100	; disabled, RTS low, transmit break
+
+; receiver interrupt
+
+rxi_on		equ %00000000	; interrupt from status bit 0 enabled
+rxi_off		equ %00000010	; interrupt from status bit 0 disabled
+
+; data terminal ready
+
+dtr_off		equ %00000000	; disable receiver transmitter, DTR high
+dtr_on		equ %00000001	; enable receiver transmitter, DTR low
+
+
+; status register
+
+sts_irq 	equ %10000000	; 0 = no interrupt, 1 - interrupt occurred
+sts_dsr		equ %01000000	; 0 = data set ready, 1 = not ready
+sts_dcd		equ %00100000	; 0 = data carrier detected, 1 = not detected
+sts_tdr		equ %00010000	; 0 = trasnmist buffer not empty, 1 = empty
+sts_rdr		equ %00001000	; 0 = receive buffer not full, 1 = full
+sts_ovr		equ %00000100	; 0 = no overrun, 1 = overrun*
+sts_frm		equ %00000010	; 0 = no frame error, 1 = error*
+sts_pty		equ %00000001	; 0 = no pairty error, 1 = error*
+
+; * = no interrupt generated
+
+

@@ -1,0 +1,2234 @@
+;**********************************************************************
+;
+; Tiny Basic 65
+;
+; - a version of Tiny Basic that completely ignores any portability concerns
+; in favor of making a version specific to 6502-family processors
+;
+; - for HXA assembler (also non-portable)
+; - this version creates a 16K ROM image meant
+; for the SYMON emulator by Seth Morabito
+; - https://github.com/sethm/symon
+;
+; by Anton Treuenfels
+;
+; first created: 06/15/20
+; last revision: 10/30/20
+;
+; 
+			listfile "tinybasic.lst"
+			listoff	includes
+			pagesize 0,0				; infinite height, width (widescreen editor makes this ok)
+			
+			objfile	"tinybasic.rom"
+
+			cpu		"6502"
+
+;**********************************************************************
+;
+; Customizations
+;
+;**********************************************************************
+
+zpBase		equ	$20		; start address of zero page memory use
+tbBase		equ	$C000	; start address of interpreter (start of SyMon ROM space)
+
+; user program area (SyMon RAM space)
+; - specifed as string expressions for flexibility
+; - set 'userTop$' to 'RAMTEST' to have memory searched at cold start
+; from 'userBot$' to the first ROM address (and set that as 'memTop')
+
+userBot$	equ "$200"	
+userTop$	equ "segbeg(evalStk)"
+
+maxOperands	equ	32		; max# 16-bit operands on evaluation stack (range 0->128)
+maxGosubs	equ	32		; max# active subroutines (range 0->128)
+inpBuf 		equ $100	; start of user input buffer
+inpBufSize	equ	72		; input buffer size
+
+needLF		equ 1		; flag: !0 = send LF after CR (and any padding)
+padCrLF		equ 0		; number of pad chars to send after CR
+padPrint	equ 0		; flag: !0 = output one pad char after any non-CR output
+padChar		equ $00		; char to use for padding
+
+tabSize		equ 8		; should be a power of two < maxCols (2,4,8,...)
+maxCols		equ 125		; maximum output device columns
+
+;**********************************************************************
+
+CH_BRK		equ $03		; break (ctrl-C)
+CH_BEL		equ $07		; bell
+CH_BS		equ $08		; backspace
+CH_LF		equ $0A		; line feed
+CH_CR		equ	$0D		; carriage return
+CH_CAN		equ $18		; cancel (ctrl-X)
+CH_SPC		equ $20	 	; space
+CH_DEL		equ $7F		; delete
+
+IMM_PROMPT	equ	':'		; immediate mode prompt
+INP_PROMPT	equ '?'		; INPUT prompt
+ERR_MESG	equ '!'		; mark error message
+
+************************************************************************
+
+debug		equ 1		; 0 = no, !0 = yes
+
+;**********************************************************************
+;
+; Format of a BASIC line in program text area
+;
+;**********************************************************************
+
+; two byte hexadecimal line#, one or more text characters, carriage return
+
+; | line# lo | line# hi | char+ ] | CR |
+
+; if an input line starts with a decimal line#:
+; - if it is followed only by a CR it is deleted (if it exists)
+; - any other line is inserted (if it does not exist) or overwritten (if it does)
+	
+;**********************************************************************
+;
+; Memory Map
+;
+;**********************************************************************
+		
+; lay out an explicit memory map for easy reference (and fewer mistakes)
+
+			usesegments
+			
+			; zero page memory use
+			
+			
+			; Tiny BASIC permanent use
+			
+			segment	zpBasic
+			
+			absorg	zpBase
+			uninitialized
+		
+			ends
+
+			; common memory may be re-defined at will
+			; - just be careful to guarantee non-simultaneous use
+			
+			segment zpCommon
+			
+			absorg	zpBase + $18
+			uninitialized
+			common
+			
+data0		ds 2
+data1		ds 2
+data2		ds 2
+addr0		ds 2
+addr1		ds 2
+
+			ends
+			
+			; make sure these first two do not overlap
+			; - if they do, just move start of zpCommon upward
+			; - must be absolute origin or HXA will assume
+			; 16-bit rather than 8-bit addresses
+			
+			assert segend(zpBasic) <= segbeg(zpCommon)
+		
+			; user input buffer
+			; - yes, we're using the 6502 hardware stack space
+		
+			segment	inputBuf
+		
+			absorg	inpBuf
+			uninitialized
+
+			ds inpBufSize
+		
+			ends
+							
+			; variable storage
+			; - also using the hardware stack
+			
+			segment	variables
+			
+			relorg
+			uninitialized
+			
+			ds 26*2		; 'A' - 'Z'
+
+			ends
+			
+			; make sure we're leaving enough space for Tiny BASIC stack use
+			
+			assert segend(variables) < $200 - 64
+					
+			; expression evaluation stack
+			; - these go at the top of available RAM (in SyMon configuration)
+			; - could just as well put at bottom if we liked
+			; - we could also make input buffer and variable storage contiguous with these if we liked
+
+			segment evalStk
+			
+			relend
+			uninitialized
+
+evalStkLo	ds maxOperands
+evalStkHi	ds maxOperands
+
+			ends
+						
+			; 	GOSUB stack
+		
+			segment	gosubStk
+		
+			absend $7000			; SyMon top of user RAM /start of video memory
+			uninitialized
+		
+subStkLo	ds maxGosubs
+subStkHi	ds maxGosubs
+	
+			ends
+
+			; core routines
+			
+			segment tbCore
+			
+			absorg	tbBase
+			
+			ends
+			
+			; BASIC error messages
+			
+			segment	errMesg
+			
+			relorg
+			
+errTxt
+			
+			ends
+				
+			; IL dispatch table (opcode execution addresses)		
+			
+			segment	ilDispatch
+			
+			relorg
+			
+			ends
+
+			; IL opcode execution
+			
+			segment	ilExecute
+			
+			relorg
+			
+			ends
+			
+			; IL interpreter
+			
+			segment	ilCode
+			
+			relorg
+			
+			ends
+			
+			; sign on message
+			
+			segment signOnMsg
+					
+			relorg
+			
+			ends
+
+			; ROM padding
+			
+			listoff	object
+
+			segment romPad
+						
+			relorg
+			
+			padto $ffbf				; hardware segment start (value ret-conned from assembly segment map listing)
+			
+			ends
+			
+			liston	object
+						
+			; hardware-specific code
+			
+			segment	hardware
+			
+			absend $10000			; top of 6502 memory space
+				
+			ends
+
+		
+		
+;**********************************************************************
+;
+; Core Routines
+;
+;**********************************************************************
+
+			segment	zpBasic
+
+memTop		ds	2		; end of user memory
+memBot		ds	2		; start of user memory (AKA start of BASIC text)
+txtEnd		ds 	2		; end of BASIC text
+txtPtr		ds	2		; start of current BASIC line / input buffer
+txtNdx		ds 	1		; offset into BASIC line
+bufNdx		ds	1		; offset into input buffer
+evalPtr		ds	1		; evaluation stack pointer
+subPtr		ds	1		; gosub stack pointer
+runFlg		ds	1		; run flag: $00 = no, $80 = yes
+ptrSav		ds	2		; save area for txtPtr
+ndxSav		ds 	1		; save area for txtNdx
+
+ilPtr		ds	2		; IL instruction pointer
+
+prnCol		ds  1		; current print column / #pad chars after CR remaining
+			
+			ends
+		
+; -----------------------
+
+		segment tbCore
+		
+; -----------------------
+		
+coldStart	jmp	coldInit
+warmStart	jmp	setIlStart
+jGetChar	jmp getChar
+jPutChar	jmp	putChar
+jBrkChk		jmp	brkChk
+
+; ----------------------
+
+		segment hardware
+		
+]ioBase 	= $8800			; SyMon emulated 6551 ACIA base address
+
+			include "mos6551.def"
+
+; implement getChar
+
+getChar		lda #sts_rdr
+ -			bit ACIA_status	; receive buffer full ?
+			beq -			; b: no - busy wait
+			lda ACIA_iobuff
+			rts
+
+; implement putChar
+
+putChar		tay
+			lda #sts_tdr
+ -			bit ACIA_status	; transmit buffer empty ?
+			beq -			; no - wait
+			sty ACIA_iobuff
+			rts
+			
+; initialize 6551 ACIA
+
+initACIA	lda #prty_none + echo_off + txi_offLo + rxi_off + dtr_on
+			sta ACIA_cmnd
+			lda #stop_one + char_bits8 + clck_intrnl + baud_04800
+			sta ACIA_ctrl
+			
+		; fall through and try to make sure input buffer is empty
+
+; implement BREAK check
+
+brkChk		lda #sts_rdr
+			bit ACIA_status	; character waiting ?
+			beq +			; b: no
+			lda ACIA_iobuff
+			cmp #CH_BRK		; is it a break ?
+			beq brk1		; b: yes (carry set)
+ +			clc
+brk1		rts
+			
+; reset /power on
+
+doReset		cli
+			cld
+			jsr initACIA
+			jmp coldStart
+			
+; ignore NMI
+
+doNMI		rti
+
+; ignore IRQ
+
+doIRQ		rti
+			
+			word doNMI		; NMI vector
+			word doReset	; reset vector
+			word doIRQ		; IRQ/BRK vector
+			
+			ends
+
+
+; ------------------
+; this macro:
+; - puts in an extra subroutine call if in debug mode (for easy breakpoint setting)
+; - puts in a straight jump if not in debug mode (saving time and space)
+
+tail		macro ?label
+
+			if debug
+			jsr ?label
+			rts
+
+			else
+			jmp ?label
+
+			endif
+				
+			endm
+
+; this macro:
+; - inserts a 6502 'BIT absolute' instruction into the object code
+; - which has the effect of 'hiding' the next two-byte instruction
+; (it executes, but we don't care what the result is)
+
+			macro hide
+			
+			if !debug
+			byte $2c		; 
+			else
+			bne *+3			; work around: SyMon stops because in its emulation $Axxx addresses are undecoded
+			endif
+			
+			endm
+				
+; set or clear BASIC running flag (ie., immediate vs. program mode)
+
+setRun		sec				; running
+			byte $24		; 'BIT zp' instruction "skips" next one-byte instruction
+clrRun		clc				; not running
+			ror runFlg		; put flag into MSB 
+			lda #CH_CR		; clear input buffer
+			sta inpBuf
+			lda #0
+			sta bufNdx
+			rts
+			
+; cold initialization
+
+coldInit	cli				; enable interrupts
+			cld				; enable binary arithmetic
+			
+; sign-on message
+; - if TBx is assembled to run in RAM at the start of user memory,
+; the start of BASIC program memory can be set to the address of the
+; 'signOnMsg' segment
+; - since the message is only shown once during cold start, it doesn't
+; matter if this memory gets over-written by a BASIC program
+; - however note that any subsequent cold start would not work,
+; unless some kind of flag was used to prevent calling this routine again
+
+			jsr signOn
+			
+			segment signOnMsg
+
+signOnTxt	stringr	"(C) Copyleft 2020 - All Wrongs Reserved\r"
+			stringr " by Anton Treuenfels\r"
+			stringr "\rTB1 - A Tiny BASIC for the 6502\r"
+			
+signOn		ldx #signOn - signOnTxt - 1
+]loop		lda signOnTxt,x
+			jsr printC
+			dex
+			bpl ]loop
+			rts
+			
+			ends
+			
+; set user program RAM start
+
+			ldx #val( "<" userBot$ )
+			lda #val( ">" userBot$ )
+			stx memBot
+			sta memBot+1
+			
+; set user program RAM end
+
+			if userTop$ != "RAMTEST"	; top specified ?
+			
+			ldx #val( "<" userTop$ )
+			lda #val( ">" userTop$ )
+			stx memTop
+			sta memTop+1
+		
+; test how much RAM we have
+; - at end 'memTop' points to first non-RAM location
+
+			else
+		
+			stx memTop
+			sta memTop+1
+			ldy #1
+]loop		lda (memTop),y
+			tax
+			eor #$ff
+			sta	(memTop),y
+			cmp (memTop),y
+			php
+			txa
+			sta (memTop),y
+			inc	memTop
+			bne	+
+			inc memTop+1
++			plp
+			beq ]loop
+			
+			endif
+			
+; intialize inner interpreter
+			
+			jmp setIlStart
+
+; set pointer to end of BASIC program text
+; -ie., one past the two zero bytes marking the end
+
+setTxtEnd	clc
+			adc #2
+			bcc +
+			inx
+ +			sta txtEnd
+			stx txtEnd+1
+			rts
+			
+; read hexadecimal line number labeling a BASIC text line
+; - check to see if it's the two zero bytes marking the end of program text
+
+getLabel	ldy #$00
+			lda (txtPtr),y
+			tax
+			iny
+			lda (txtPtr),y
+			bne +
+			cpx #$00
+ +-			rts
+ 			
+; check if restoring BASIC pointer should happen
+; - yes if pointing at input buffer in program mode
+; (program mode already checked by caller)
+
+chkPtr		lda txtPtr+1
+			cmp #>inpBuf		; pointing at input buffer ?
+			bne -				; b: no
+			ldy txtNdx			; save where we are in input buffer
+			sty bufNdx
+
+; restore BASIC text pointer
+			
+			ldy ndxSav			; recover pointer to BASIC text
+			lda ptrSav
+			ldx ptrSav+1
+			bne setTxtPtr		; (b: always)
+			
+; set BASIC text pointer to first BASIC line
+
+setTxtFirst	lda memBot
+			ldx memBot+1
+			bne setNdxFirst	; (b: always)
+			
+; set BASIC text pointer to next BASIC line
+
+setTxtNext	sec				; skip over terminal CR
+			lda txtPtr
+			adc txtNdx
+			ldx txtPtr+1
+			bcc setNdxFirst
+			inx
+
+; set txtNdx to first char of BASIC line
+
+setNdxFirst	ldy #2
+
+; set BASIC text pointer
+
+setTxtPtr	sta txtPtr
+			stx txtPtr+1
+ 			sty txtNdx
+			rts
+
+; CHRGET - fetch next non-space char from BASIC line text
+
+chrGet		inc txtNdx
+chrGot		ldy txtNdx
+			lda (txtPtr),y
+			cmp #CH_SPC		; skip spaces
+			beq chrGet
+			cmp #CH_CR		; end of line ?
+			rts
+				
+; skip to end of BASIC line
+				
+skipTxtEnd	jsr chrGet
+			bne skipTxtEnd
+			rts
+
+; set up a pointer 
+
+txtToAddr0	ldx #addr0
+				
+; set up a pointer into BASIC program text based on txtPtr
+				
+txtToAddr	clc
+			lda txtNdx
+			adc txtPtr
+			sta $00,x
+			lda #$00
+			adc txtPtr+1
+			sta $01,x
+			rts
+			
+; copy txtPtr to another zero page location at offset X
+
+moveTxtPtr	ldy txtPtr
+			sty $00,x
+			ldy txtPtr+1
+			sty $01,x
+			rts
+
+; get line of input from user
+			
+getInput	ldx #0+1		; empty input buffer
+			jsr	printC		; print prompt char followed by space
+			lda #CH_SPC
+geti1		jsr printC		; (output device may not be able to backspace)
+			dex
+]next		stx bufNdx		; next available spot in input buffer
+
+			if 0			; kick the random number generator (if we have one)
+			
+			eor randNum		; not a very good generator...
+			ldx randNum+1
+			sta randNum+1
+			stx randNum
+			
+			endif
+
+]loop		jsr getChar		; get next key pressed
+			
+			and #$7f
+			beq ]loop		; b: null (is this a real possibility ?)
+
+			ldx bufNdx
+
+			cmp #CH_DEL		; check here because value is above all printable
+			beq +		
+
+			cmp #CH_SPC		; printable ?
+			bcs geti3
+
+			cmp #CH_BS		; backspace ?
+			bne geti2
+ +			txa
+ 			bne geti1		; buffer not empty
+			
+]warn		lda #CH_BEL		; something off about this char...
+			jsr printA
+			jmp ]loop
+			
+geti2		cmp #CH_CAN		; cancel line ?
+			bne +
+			ldx #$00
+			lda #CH_CR
+			
+ +			cmp #CH_CR		; end of input ?
+			bne ]warn		; b: don't know what it is...
+		
+
+geti3		cpx #inpBufSize
+			bcs ]warn		; b: buffer is full
+			sta inpBuf,x	; save
+			jsr printC		; echo
+			inx
+			cmp #CH_CR		; end of input ?
+			bne	]next
+			rts
+			
+; convert lowercase alpha to uppercase
+;
+
+toUpper		cmp #'a'
+			bcc +			; b: can't be ASCII lowercase alpha
+			cmp #'z'+1
+			bcs +			; b: ditto
+			and #%11011111	; make it uppercase
+ +			rts
+
+; read decimal number from BASIC text (if present here)
+; - could be a line number or an operand value
+; - error if > $FFFF
+; enter: BASIC txtPtr points to start of potential number
+; - if read, value of number is in numVal
+
+			segment zpCommon
+numVal		ds 2			; number value
+			ends
+			
+getNumber	jsr chrGot
+			cmp #'9'+1
+			bcs +			; b: not a digit
+			cmp #'0'
+			bcs gtnm1		; b: digit '0' - '9'
+ 			sec
+ +			rts				; SEC = no number read
+		
+gtnm1		ldx #$00
+			stx numVal
+			stx numVal+1
+]loop		tax				; save ASCI char
+			ldy numVal+1	; save unshifted value (* 1)
+			lda numVal
+			asl
+			rol	numVal+1	; numVal * 2
+			asl 
+			rol	numVal+1	; numVal * 4
+			clc
+			adc numVal
+			sta numVal
+			tya	
+			adc numVal+1	; numVal * 5
+			asl numVal
+			rol
+			tay				; numVal * 10
+			txa				; get char back
+			and #$0F		; isolate digit value
+			adc numVal		; add next digit
+			bcc +
+			iny
+			beq	rptRng		; b: >65535 ($FFFF)
+ +			sta numVal
+			sty numVal+1
+		
+			jsr chrGet		; next char
+			cmp #'9'+1
+			bcs +			; b: not a digit
+			cmp #'0'
+			bcs ]loop		; a digit ! (and not a CR!)
+				
+ + 			clc				; CLC = number read
+ 			rts
+				
+; find line in BASIC text
+; returns:
+; c-clr -> line# found (z also clr)
+; c-set -> line# not found
+;   z-set -> reached end of program text
+;   z-clr -> txtPtr -> first line# greater than target#
+
+			segment zpCommon
+linNum		ds 2			; aka numVal from getNumber
+			ends
+
+findLine	jsr setTxtFirst	; point to first BASIC line
+			bne	fdln1		; b: forced
+				
+]loop		jsr skipTxtEnd	; advance to end of BASIC line
+			jsr setTxtNext	; set BASIC text pointer to next line
+fdln1		jsr getLabel	; pick up line#
+			beq	+			; b: end of program text
+			cmp linNum+1	; check hi byte
+			bcc ]loop		; b: line# < target#
+			bne	+			; b: line# > target#
+			cpx linNum		; check lo byte
+			bcc ]loop		; b: line# < target#
+			bne +			; b: line# > target#
+			clc				; line# = target#
+ +			rts
+ 			
+; report numeric range error
+
+rptRng		jmp	errRng
+
+; -----------------------
+; 	expression evaluation
+; -----------------------
+			
+; divide NOS by TOS (no direct replacement on eval stack)
+
+			segment zpCommon
+quotient						; (quotient replaces dividend)
+dividend	ds 2				; (aka data0)
+signQuo		ds 2				; sign of quotient (XOR of dividend and divisor)
+divisor		ds 2
+remainder	ds 2
+signRem		ds 2				; sign of remainder (same as sign of dividend)
+			ends
+			
+divide		pha					; save index of the result we're looking for
+
+			ldx #divisor
+			jsr popPos
+			sta signQuo			; save for later
+
+			ora divisor
+			beq rptRng			; b: division by zero is not permitted
+
+			ldx #dividend
+			jsr popPos
+			sta signRem			; remainder sign
+			eor signQuo
+			sta signQuo			; quotient sign
+			
+			lda #$00
+			sta remainder
+			sta remainder+1
+			ldx #16
+
+]loop		asl dividend
+			rol dividend+1
+			rol remainder
+			rol remainder+1
+			sec
+			lda remainder
+			sbc divisor
+			tay
+			lda remainder+1
+			sbc divisor+1
+			bcc +
+			sty remainder
+			sta remainder+1
+			inc quotient
+			
+ +			dex
+			bne ]loop
+			
+			pla					; recover index of result we're looking for
+			tax
+			lda $02,x			; sign of result
+			bpl	+				; b: positive
+			jsr popp1			; negate
+ +			ldy $01,x
+			lda $00,x
+			tax
+			tya
+			tail push16
+				
+; pop value and make sure it's positive
+
+popPos		jsr pop16
+			
+; negate value if negative
+
+popp1		asl
+			bcc	+				; b: positive
+			lda #$00			; negate
+			sbc $00,x
+			sta $00,x
+			lda #$00
+			sbc $01,x
+			sta $01,x
+			sec
+ +			ror					; MSB = original sign
+ 			rts
+			
+; replace TOS by product of NOS and TOS
+
+			segment	zpCommon
+mpcand		ds 2				; (aka data0)
+mplier		ds 2				; (aka data1)
+product		ds 4				; result
+			ends
+
+multiply	jsr popData1
+			jsr popData0
+			ldx #$00
+			ldy #$00
+]loop		lsr mplier+1
+			ror mplier
+			bcc +
+			clc
+			txa
+			adc mpcand
+			tax
+			tya
+			adc mpcand+1
+			tay
+ +			asl mpcand
+			rol mpcand+1
+			lda mplier
+			ora mplier+1
+			bne ]loop
+			tya					; sign correct to 16 bits
+			tail push16
+			
+			if 0				; an alternative algorithm
+			
+multiply	ldx evalPtr
+			cpx #2
+			bcc rptStk
+			lda #$00
+			sta product+2
+			ldy #16
+]loop		lsr evalStkHi-2,x
+			ror evalStkLo-2,x
+			bcc +
+			pha
+			clc
+			lda evalStkLi-1,x
+			adc product+2
+			sta product+2
+			pla
+			adc evalStkHi-1,x
+ +			ror
+			ror product+2
+			ror product+1
+			ror product
+			dey ]loop
+			sta product+3		; full 32-bit result (not sign correct)
+			lda product			;(but correct to 16 bits)
+			sta evalStkLo-1,x
+			lda product+1
+			sta evalStkHi-1,x
+			dec evalPtr
+			rts
+			
+			endif
+				
+; push 16-bit value in X (lo) and A (hi) onto evaluation stack
+
+push16		ldy evalPtr
+			cpy #maxOperands
+			bcs rptStk		; b: stack full
+			sta evalStkHi,y
+			txa				; can eliminate if exprStk is on zero page
+			sta evalStkLo,y
+			inc evalPtr
+			rts
+
+; pop a 16-bit value from evaluation stack into a specific location
+
+popAddr0	ldx #addr0
+			hide
+			
+popData1	ldx #data1
+			hide
+
+popData0	ldx #data0
+
+pop16		ldy evalPtr
+			beq rptStk			; b: stack empty
+			lda evalStkLo-1,y
+			sta $00,x
+			lda evalStkHi-1,y
+			sta $01,x
+			dec evalPtr
+			rts
+					
+; negate TOS
+
+negate		ldy evalPtr
+			beq	rptStk
+			sec
+			lda #$00
+			sbc evalStkLo-1,y
+			sta evalStkLo-1,y
+			lda #$00
+			sbc evalStkHi-1,y
+			sta evalStkHi-1,y
+			rts
+			
+; replace TOS by difference of NOS and TOS
+; - actually implemented directly in iL interpreter as NEGA followed by ADDI
+; (may not work for minimum negative value -32786/$8000)
+
+			if 0				; an alternative approach
+
+subtraction	ldy evalPtr
+			cmp #2
+			bcc rptStk
+			lda evalStkLo-2,y
+			sbc evalStkLo-1,y
+			sta evalStkLo-2,y
+			lda evalStkHi-2,y
+			sbc evalStkHi-1,y
+			sta evalStkHi-2,y
+			dec evalPtr
+			rts
+			
+			endif
+			
+; replace TOS by sum of NOS and TOS
+
+addition	ldy evalPtr
+			cmp #2
+			bcc rptStk
+			clc
+			lda evalStkLo-2,y
+			adc evalStkLo-1,y
+			sta evalStkLo-2,y
+			lda evalStkHi-2,y
+			adc evalStkHi-1,y
+			sta evalStkHi-2,y
+			dec evalPtr
+			rts		
+						
+; report stack empty/full error
+				
+rptStk		jmp errMem
+				
+; -----------------------
+; push and pop from GOSUB stack
+; - used for both BASIC and il interpreter subroutine calls
+; -----------------------
+
+; push pointer onto subroutine call stack
+
+pushSub		ldy subPtr
+			cpy #maxGosubs
+			bcs rptStk
+			lda $01,x
+			sta subStkHi,y
+			lda $00,x
+			sta subStkLo,y
+			inc subPtr
+			rts
+			
+; pop pointer from subroutine call stack
+				
+popSub		ldy subPtr
+			beq rptStk
+			lda subStkHi-1,y
+			sta $01,x
+			lda subStkLo-1,y
+			sta $00,x
+			dec subPtr
+			rts
+		
+; -----------------------
+; 	misc print routines
+; -----------------------
+
+			segment zpCommon
+
+leadZero				; = $00 after conversion
+bin16		ds 2		; 16-bit binary value to convert (aka data0)
+bcd24		ds 3		; 24-bit BCD representation after conversion
+			
+			ends
+
+; list one line of BASIC program
+
+listLine	stx bin16			; print line#
+			sta bin16+1
+			jsr printNum
+			lda #CH_SPC			; followed by space
+]loop		jsr printC
+			ldy txtNdx
+			inc txtNdx
+			lda (txtPtr),y
+			cmp #CH_CR
+			bne ]loop
+			sty txtNdx			; re-set to terminal CR
+			tail printA
+
+; print decimal representation of unsigned value in bin16
+
+; convert binary to BCD
+; ref: http://6502.org/source/integers/hex2dec-more.htm
+			
+printNum	lda #$00
+			sta bcd24
+			sta bcd24+1
+			sta bcd24+2
+			php
+			sed				; set decimal mode (tricky)!
+			ldx #16
+]loop		asl bin16
+			rol bin16+1		; get a bit into carry flag
+			lda bcd24
+			adc bcd24		; double BCD value plus carry
+			sta bcd24
+			lda bcd24+1
+			adc bcd24+1
+			sta bcd24+1
+			lda bcd24+2
+			adc bcd24+2
+			sta bcd24+2
+			dex
+			bne ]loop
+			plp
+			
+; print 24-bit BCD value, suppressing leading zeros
+						
+			lda bcd24+2
+			jsr printBCD
+			lda bcd24+1
+			jsr printBCD
+			lda bcd24
+			bne printBCD
+			ldx leadZero	; some other non-zero pair already seen ?
+			bne printBCD	; b: yes
+			lda #'0'		; value is zero...
+			bne printC
+			
+; print both halves of a BCD coded value, hi nybble first
+			
+printBCD	pha
+			lsr				; put hi in lo
+			lsr
+			lsr
+			lsr
+			jsr pbcd1
+			pla				; now do lo nybble
+pbcd1		and #$0F
+			bne +
+			ldx leadZero	; first non-zero digit printed ?
+			beq prna2		; b: not yet
+ +			ora #$30		; convert to ASCII
+			sta leadZero	; fall through
+				
+; update output column and print (ie., count output characters)
+; - returns: carry clear = no overflow, set = overflow
+; - we could add code to signal an error instead of silently ignoring...
+
+printC		ldy prnCol
+			cpy #maxCols
+			bcs prna2				; b: print line overflow
+			inc prnCol
+				
+; print character in A-register and one pad character (if enabled)
+; - always returns carry clear, A and X unchanged
+		
+printA		tay
+			pha
+			txa
+			pha
+			tya
+
+			cmp #CH_CR			; carriage return ?
+			bne +				; b: no
+			
+			jsr jPutChar		; output CR			
+
+			lda #padCrLf		; load CR pad count (if any)
+			sta prnCol
+		
+			if padCrLF != 0		; any pad characters (ie., slow device) ?
+
+]loop		lda #padChar		; don't assume output routine saves A...
+			jsr jPutChar
+			dec prnCol
+			bne ]loop
+		
+			endif
+			
+		; padding after CR or not, 'prnCol' = 0 at this point
+		 
+			if needLF == 0		; no line feed needed ?
+			
+			beq prna1
+			
+			else
+			
+			lda #CH_LF
+			
+			endif
+			
+ +			jsr jPutChar
+			
+			if padPrint != 0	; pad output ?
+
+			lda #padChar
+			jsr jPutChar
+			
+			endif
+			
+prna1		pla
+			tax
+			pla
+			
+			clc
+prna2		rts
+			
+; -----------------------
+
+			ends	tbCore
+
+; -----------------------
+
+
+;**********************************************************************
+;
+; IL routines
+;
+;**********************************************************************
+
+; this macro:
+; - assigns an opcode value to an IL instruction name
+; - makes an entry in the dispatch table to the code that executes the instruction
+; - creates a label marking the start of that code
+
+; assumptions on use:
+; - the code implementing the instruction immediately follows macro expansion
+; - we don't care what the actual opcode values turn out to be,
+; as long as they start at $80 (which simplifies dispatch)
+
+]ilToken	equ	$80		; first IL token value
+
+opcode		macro	?name
+
+onexpand 	?name	equ	]ilToken	; when invoked, assign token value to ?name
+]ilToken	equ ]ilToken + 1		; next token value
+
+			segment ilDispatch		
+		
+			word	do_?name-1		; put handler address into dispatch table
+	
+			ends
+		
+onexpand 	do_?name				; handler starts right here
+
+			endm
+		
+; -----------------------
+		
+			segment ilExecute
+		
+; -----------------------
+		
+;	INIT opcode	- initialize BASIC program space
+		
+			opcode INIT
+			
+			jsr clrRun			; no BASIC program running			
+			tay					; (A = $00)
+			sta	(memBot),y		; put two zero bytes at start of user space
+			iny					; (a line number of zero marks end of BASIC program)
+			sta (memBot),y
+			lda memBot
+			ldx memBot+1
+			jsr setTxtEnd		; mark end of BASIC text
+			
+; initialize for RUN
+
+readyRun	jsr setTxtFirst		; set BASIC text pointer first BASIC line (if any)		
+			ldx #segend(variables)
+			lda	#$00			; set all variables to zero
+]loop		sta segbeg(variables),x
+			dex
+			bpl	]loop
+			sta subPtr			; clear subroutine call stack
+rrun1		lda #$00
+			sta evalPtr			; clear evaluation stack
+ 			rts
+			
+; 	XNIT opcode - BASIC statement initialization (aka XINIT)
+
+			opcode XNIT
+			
+			jsr jbrkChk			; check for user break
+			bcc rrun1			; b: none detected
+			jmp rptBrk
+
+;  	CMPR opcode - signed compare of TOS to TOS-2, check result against TOS-1
+; 	ref: http://www.6502.org/tutorials/compare_beyond.html
+		
+cmpEqu		equ %001
+cmpLes		equ %010
+cmpGrt		equ %100
+
+			opcode CMPR
+			
+			jsr popData1		; TOS -< num1 in data1 (right side)
+			ldx #data2
+			jsr pop16			; TOS -> comparison type in data2
+			jsr popData0		; TOS -> num0 in data0 (left side)
+			
+			ldx #cmpLes			; assume left < right	
+			sec
+			lda data0+1			; left...
+			sbc data1+1			; ...minus right
+			bvc +				; (equality comparison in Z)
+			eor #$80			; N xor V
+ +			bmi	cmpr2			; b: num0 < num1
+			bvc +
+			eor #$80			; restore Z flag
+ +			bne cmpr1			; num0 != num1 && !(num0 < num1)
+			lda data0
+			sbc data1
+			bcc cmpr2			; b: num0 < num1
+			bne cmpr1			; b: num0 > num1
+			
+			ldx #cmpEqu			; num0 == num1
+			hide
+cmpr1		ldx #cmpGrt			; left > right
+cmpr2		txa
+			and data2			; comparison result in Z
+			beq do_RMRK			; b: comparison failed
+			rts
+			
+; 	RMRK opcode - skip remainder of BASIC line
+
+			opcode RMRK
+			
+ 			jsr skipTxtEnd
+			
+; 	NEXT opcode - set up for next BASIC line (aka NXT)
+
+			opcode NEXT
+			
+			bit runFlg			; immediate mode ?
+			bpl +				; b: yes
+			jsr setTxtNext		; set BASIC text pointer to next BASIC line
+			jsr getLabel		; pick up hex line#
+			bne runp2			; b: not end of BASIC text
+  +			jmp do_STOP			; return to immediate mode
+
+;	XFER opcode - change current BASIC execution line
+
+			opcode XFER
+			
+			jsr popData0
+			jsr chkLine			; valid ? (invalid line# 0 could be "found"...)
+			jsr findLine		; look for it
+			bcc runp1			; b: found it
+			jmp errLin
+
+;	RUNP opcode - begin execution at first BASIC line
+
+			opcode RUNP
+
+			jsr readyRun			
+runp1		jsr setRun			; ...in case currently in immediate mode...
+runp2		ldx #ptrSav			; save pointer to start of current BASIC line
+			jsr moveTxtPtr		; (for INPUT processing and error reporting)
+			jmp setIlPrg		; next BASIC statement
+			
+; 	LIST - list program (entire)
+
+			opcode LIST
+				
+			jsr do_SAVE			; ...in program mode we want to come back to here
+			jsr setTxtFirst		; set pointer to first line
+			bne ilst1			; b: forced
+
+]loop		jsr listLine		; list line
+			jsr jbrkChk
+			bcs do_RSTR
+			jsr setTxtNext		; set pointer to next line	
+ilst1		jsr getLabel		; pick up line#
+			bne ]loop			; b: not at end of program
+
+;	RSTR opcode - restore pointer to end of calling BASIC line
+
+			opcode RSTR
+			
+			lda #0				; (BASIC text pointer + ndx = terminal CR of caller line)
+			sta txtNdx
+			ldx #txtPtr
+			jmp popSub
+
+;	SAVE opcode - set up for BASIC subroutine call (aka SAV)
+
+			opcode SAVE
+
+			jsr txtToAddr0		; (BASIC text pointer + ndx = terminal CR of caller line)
+			jmp pushSub			; (X = #addr0)
+											
+;	DONE opcode - make sure we are at end of BASIC line
+
+			opcode DONE
+			
+			jsr chrGot			; pointing at terminal CR ?
+			beq pstr1			; b: yes
+rptSyn		jmp do_ERR			; "syntax error"
+ 
+; 	PSTR opcode - print literal string (aka PRS)
+
+			opcode PSTR
+			
+]loop		ldy txtNdx
+			inc txtNdx		
+			lda (txtPtr),y
+			cmp #'"'			; end of literal string ?
+			beq pstr1			; b: yes
+			cmp #CH_CR
+			beq	rptSyn			; b: no closing quote
+	 		jsr printC
+			bcc ]loop			; b: still room to print
+pstr1		rts
+
+;	PNUM opcode - print signed number at top of evaluation stack (aka PRN)
+
+			opcode PNUM
+			
+			ldx #bin16
+			jsr popPos
+			bpl +
+			lda #'-'
+			jsr printC
+ +			tail printNum
+ 
+						
+; 	INPB opcde - check/fill input buffer (aka INNUM)
+
+			opcode INPB
+			
+			bit runFlg			; immediate mode ?
+			bpl +				; b: yes
+			lda txtNdx
+			sta ndxSav
+			ldy bufNdx
+			jsr gtln1			; set pointer to input buffer
+ +			jsr chrGot			; buffer empty/exhausted ?
+			beq +				; b: yes, refill
+			cmp #','			; expression separator ?
+			bne rptSyn			; b: no
+			inc txtPtr			; skip it
+			rts
+			
+ + 			lda #INP_PROMPT
+			hide
+			
+;	GTLN opcode - get input line from user (aka GETLINE)
+
+			opcode GTLN
+		
+			lda #IMM_PROMPT
+			jsr getInput		; get user input
+			ldy #0
+gtln1		lda #<inpBuf		; set text pointer to input buffer
+			ldx #>inpBuf		; (if duplicate effort -> we don't care)
+			tail setTxtPtr
+		
+; 	NWLN opcode - send a newline sequence to output device (aka NLINE)
+
+			opcode NWLN
+					
+			lda #CH_CR			; carriage return
+			tail printA
+		
+;	TABC opcode - tab to next output column (aka SPC)
+
+			opcode TABC
+			
+]loop		lda #CH_SPC			; use space chars to tab
+			jsr printC
+			bcs +				; b: print line overflow			
+			lda prnCol
+			and #tabSize-1		; reached a multiple of two ?
+			bne ]loop
+ +			rts
+			
+; 	TSTL opcode - check input line for leading line number
+
+			opcode TSTL
+		
+			jsr getNumber
+			bcs jump1			; b: no line number present (always forward branch)
+			jsr chkLine
+			bne rtrn1			; (b: forced if returns at all)
+						
+; while in general we do not care what specific values are associated with
+; any particular opcode, in the case of CALL and JUMP we want the forward
+; branch opcode to have a zero bit in the least significant position.
+; We could guarantee this by making JMPF the very first opcode ($80),
+; or we could make sure there's an even number of opcodes before this point,
+; or we could hack the opcode at assembly time. Guess what we're going to do ?
+
+			if ]ilToken & %1
+]ilToken	equ	]ilToken+1
+			endif
+
+; 	CALL opcode - relative subroutine call in iL interpreter
+
+CALL		equ ]ilToken * 256	;for use in 'lbranch' macro
+
+			opcode CLLF
+			
+			ldx #ilPtr
+			jsr pushSub
+			jmp jump1
+					
+			opcode CLLB
+			
+			ldx #ilPtr
+			jsr pushSub
+			jmp do_JMPB
+			
+; 	JUMP opcode - relative branch (aka JMP)
+
+JUMP		equ ]ilToken * 256	; for use in 'lbranch' macro
+
+			opcode JMPF			; forward branch (0..+255)
+			
+jump1		jsr ilGetChar		; pick up relative offset
+jump2		clc
+jump3		adc ilPtr
+			sta ilPtr
+			bcc +
+			inc ilPtr+1
+ +			rts
+					
+			opcode JMPB			; backward branch (-255..0)
+			
+			jsr ilGetChar		; pick up relative offset
+jump4		clc
+			adc ilPtr
+			sta ilPtr
+			bcs +
+			dec ilPtr+1
+ +			rts
+ 
+jump5		jsr ilGotChar		; re-read relative offset (-128..+127)
+			bpl jump2
+			bmi jump4
+
+;	TSTE opcode - test if current BASIC char is end-of-line (no equivalent)
+
+			opcode TSTE
+			
+			jsr chrGot			; at end of BASIC line ?
+			beq rtrn1			; b: yes - eat branch value (but no advance in BASIC text as in TEST)
+			jsr ilGetChar		; get branch value
+			bpl jump2
+			bmi jump4
+			
+;	RTRN opcde - return from iL interpreter subroutine
+
+			opcode RTRN
+			
+			ldx #ilPtr
+			jsr popSub
+rtrn1		jmp ilGetChar		; eat offset value after CALL opcode
+			
+; 	TEST opcode - check for match to BASIC keyword (aka TST)
+
+			opcode TEST
+			
+			jsr chrGot			; skip any spaces...
+			jsr txtToAddr0		; point to actual first char to check
+			jsr ilGetChar		; advance to branch on fail offset (Y = 0 on return)
+]loop		lda (addr0),y		; BASIC char (no spaces allowed in keywords)
+			jsr toUpper
+  			iny					; (iL points at branch offset byte)
+			eor (ilPtr),y		; iL keyword char
+			beq ]loop
+			asl					; end of keyword (A == $80) ?
+			bne jump5			; b: no, try next keyword
+			clc
+			tya					; update BASIC text index to skip keyword
+			adc txtNdx
+			sta txtNdx
+			tya
+			bcc jump3			; (b: forced forward jump in il interpreter)
+			
+;	TSTN opcode - check for a numeric literal in BASIC text
+
+			opcode TSTN
+			
+			jsr ilGetChar		; advance to branch on fail offset
+			jsr getNumber
+			bcs jump5			; b: no numeric literal found
+			ldx numVal
+			lda numVal+1
+			bpl tstv1			; b: within signed range
+			
+  -			jmp errRng			; value out of range
+			
+; test if number is valid line#
+; - range is 1..63999
+
+chkLine		lda numVal+1
+			cmp #>64000
+			bcs -
+			ora numVal
+			beq -
+			rts
+			
+; 	TSTV opcode - check if current BASIC char is a variable name
+
+			opcode TSTV
+			
+			jsr ilGetChar		; advance to branch on fail offset
+			jsr chrGot
+			jsr toUpper
+			cmp #'A'
+			bcc jump5
+			cmp #'Z'+1
+			bcs	jump5
+			
+			; advance to next char in BASIC line
+			
+			inc txtNdx
+
+			; this next code depends on the variable table being on one page
+			; - here just in case its location is moved
+			
+			assert >segbeg(variables) == >segend(variables)
+			
+			; push address of variable on eval stack
+			
+			asl
+			adc #<(segbeg(variables)-('A' * 2))
+			tax
+			lda #>segbeg(variables)
+tstv1		tail push16
+
+; 	STOR opcode - store value from eval stack to variable (aka STORE)
+
+			opcode STOR
+
+			jsr popData0
+			jsr popAddr0
+			ldy #0
+			lda data0
+			sta (addr0),y
+			iny
+			lda data0+1
+			sta (addr0),y
+			
+	; also restore correct read context (if necessary)
+
+			bit runFlg			; immediate mode ?
+			bpl +				; b: yes
+			jsr chkPtr
+ + 			rts
+
+;	LOAD opcode - load value of variable to eval stack (aka IND)
+
+			opcode LOAD
+
+			jsr	popAddr0
+			ldy #0
+			lda (addr0),y
+			tax
+			iny
+			lda (addr0),y
+			tail push16
+								
+; 	ISRT opcode - insert BASIC text line (aka INSRT)
+
+			opcode ISRT
+			
+			; txtPtr points into input buffer
+			
+			jsr chrGot
+			sty data1			; offset of first non-space after line#
+			beq +				; b: first non-space is end of line
+			jsr skipTxtEnd		; skip to end of line
+ +			tya
+			sbc data1			; (carry is set)
+  			sta data1+1			; # text bytes to insert
+ 			
+			; look for an existing BASIC line with same line#
+			; - after this txtPtr points into BASIC program text
+			; at the point any insertion/deletion should happen
+			
+			jsr findLine
+			bcs isrt1			; b: not found
+
+			; delete BASIC line
+			; - the easy way, just by copying each following line down
+	
+			ldx #addr1			; ... is also destination start address
+			jsr moveTxtPtr
+			jsr skipTxtEnd		; find start of next line
+			jsr setTxtNext
+			ldx #addr0			; ...which is also source start address
+			jsr moveTxtPtr
+			lda addr1			; put this back for possible insertion later
+			ldx addr1+1
+			sta txtPtr
+			stx txtPtr+1
+			
+			; check if we've reached end of BASIC text
+			; - which we have right away if we're deleting last line
+			
+]loop		ldy #0				; copy line#
+			lda (addr0),y
+			sta (addr1),y
+			iny
+			lda (addr0),y
+			sta (addr1),y
+			ldx #0
+			ora (addr1,x)
+			beq del1			; b: end of deletion
+ -			iny					
+			lda (addr0),y
+			sta (addr1),y
+			cmp #CH_CR			; copied line ?
+			bne -				; b: no
+			
+			tya					; point source to start of next line
+			adc addr0
+			sta addr0
+			bcc +
+			inc addr0+1
+ +			sec					; update destination by the same amount
+			tya
+			adc addr1
+			sta addr1
+			bcc ]loop
+			inc addr1+1
+			bcs ]loop
+			
+del1		lda addr1
+			ldx addr1+1
+			jsr setTxtEnd		; update end of text pointer
+						
+			; make room for any new BASIC line
+		
+ isrt1		lda data1+1			; how much space do we need ?
+			beq	isrt2			; none, so done
+			
+			; make space for new BASIC line
+
+			clc
+			lda txtEnd
+			sta addr0			; set source end address lo
+			adc #2+1			; account for line# plus end of line bytes
+			adc data1+1			; (must be < 254)
+			ldx txtEnd+1
+			stx addr0+1			; source end address hi
+			bcc +
+			inx					; BASIC lines always < 256 chars
+ +			cpx memTop+1
+			bcc +				; b: < memTop
+			cmp memTop
+			bcc +				; b: < memTop
+			jmp errMem			; >= memTop
+
+ +			sta txtEnd			; new end of BASIC
+			stx txtEnd+1
+			
+			sta addr1			; ..also destination end address hi
+			stx addr1+1
+
+			sec					; how many bytes to move ?
+			lda addr0
+			sbc txtPtr
+			tay					; partial page count
+			lda addr0+1
+			sbc txtPtr+1
+			tax					; whole page count
+			inx					; ...plus one
+			tya				
+			beq	mksp2			; b: no partial page to move
+			
+			sta data2
+			sec
+			lda addr0			; adjust source end
+			sbc data2
+			sta addr0
+			bcs +
+			dec addr0+1
+			sec
+ +			lda addr1			; adjust destination end
+			sbc data2
+			sta addr1
+			bcs	mksp1
+			dec addr1+1
+			bcc mksp1			; b: forced
+						
+]loop		lda (addr0),y		; copy up to 255 bytes
+			sta (addr1),y
+mksp1		dey
+			bne ]loop
+ 			lda (addr0),y		; copy last byte
+			sta (addr1),y
+mksp2		dec addr0+1
+			dec addr1+1
+			dex
+			bne mksp1
+			
+			; insert new BASIC line
+			
+ 			ldy #0
+			lda linNum
+			sta (txtPtr),y		; (points at insertion address)
+			iny
+			lda linNum+1
+			sta (txtPtr),y
+			
+			ldx data1			; offset into input buffer of start of BASIC text			
+]loop		lda inpBuf,x
+			iny
+			sta (txtPtr),y		
+			inx
+			cmp #CH_CR
+			bne ]loop
+		
+isrt2		rts
+
+;	LITB - push a literal value < 256 on to evaluation stack (aka LIT)
+
+			opcode LITB
+			
+			jsr ilGetChar		; pick up the value
+			tax
+			lda #$00			; hi byte is always zero
+			tail push16
+
+;	NEGA - replace TOS with negation of TOS (aka NEG)
+
+			opcode NEGA
+			
+			jmp negate
+			
+; 	SUBT - replace TOS with difference of TOS and NOT
+
+			opcode SUBT
+			
+			jsr negate
+			
+; 	ADDI - replace TOS with sum of NOS and TOS (aka ADD)
+
+			opcode ADDI
+			
+			jmp	addition
+			
+;	MULT - replace TOS with product of NOS and TOS (aka MUL)
+
+			opcode MULT
+			
+			jmp multiply
+			
+;   MODU - replace TOS with remainder of NOS divided by TOS (no equivalent)
+
+			opcode MODU
+			
+			lda #remainder
+			hide
+			
+			
+; 	DIVD - replace TOS with quotient of NOS divided by TOS (aka DIV)
+
+			opcode DIVD
+			
+			lda #quotient
+			tail divide
+			
+; -----------------------
+		
+			ends	ilExecute
+		
+; -----------------------
+		
+;**********************************************************************
+;
+; IL program - the actual low level interpreter
+;
+;**********************************************************************
+						
+			segment ilCode
+
+; get byte from IL interpreter code
+			
+ilGetChar	inc	ilPtr
+			bne ilGotChar
+			inc	ilPtr+1
+ilGotChar	ldy #0
+			lda (ilPtr),y
+			rts
+
+; this macro:
+; - puts the text of an error message into the error message table
+; - loads a register with the offset of that message in the table
+
+]errNdx	= 1
+
+makeErr		macro ?text
+
+			segment errMesg
+			
+			string ?text
+			
+			ends
+			
+			ldx #]errNdx
+			
+]errNdx	= ]errNdx + 3
+
+			endm
+			
+; ---	informational messages (only one)
+									
+; report "break"
+
+rptBrk		makeErr "BRK" 
+			hide
+			
+; ---	error messsages
+			
+; report "line not found" error
+
+errLin		makeErr "LIN"
+			hide
+			
+; report "value out of range" error
+
+errRng		makeErr "RNG"
+			hide
+			
+; report "out of memory" error
+		
+errMem		makeErr "MEM"
+			hide
+			
+; report iL interpreter error (positive value opcode)
+			
+			if debug
+errInt		makeErr "INT"
+			hide
+			endif
+
+; 	ERR opcode - report syntax error
+
+			opcode ERR
+
+			makeErr "SYN"
+			
+; report error
+
+ilError		jsr do_NWLN
+			lda errTxt-1,x
+			jsr printC
+			lda errTxt,x
+			jsr printC
+			lda errTxt+1,x
+			jsr printC
+			cpx #1*3		; informational only?
+			bcc +			; b: yes
+			lda #ERR_MESG
+			jsr printC
+			lda #CH_BEL
+			jsr printA
+ + 			jsr do_NWLN
+			bit runFlg		; immediate mode ?
+			bpl setIlImm	; b: yes
+			jsr chkPtr		; get back current BASIC line
+ 			jsr getLabel	; (returns with Y = 1)
+			iny
+			sty txtNdx		; index to first char of current BASIC line
+			jsr listLine
+			
+;	STOP opcode - return to immediate mode (aka FIN)
+
+			opcode STOP
+			
+			jsr clrRun
+						
+; three labels need to be on same page
+			
+			assert >(ilStart) == >(iLXec-1)
+			
+setIlImm	ldx #<(ilc1-1)		; run interpreter in immediate mode
+			hide
+setIlStart	ldx	#<(ilStart-1)	; run interpreter from start
+			hide
+setIlPrg	ldx #<(ilXec-1)		; run interpreter in program mode
+
+			lda #>(ilStart-1)	; (this is why they must all be on same page)
+			
+			stx	ilPtr
+			sta ilPtr+1
+			ldx #$ff			; clear hardware stack
+			txs					; (removes any annoying return address)
+]loop		jsr ilGetChar
+
+			if debug
+			bpl errInt
+			endif
+			
+			jsr dispatch
+			jmp	]loop
+																
+; execute IL opcode				
+				
+dispatch	asl
+			tax
+			lda	segbeg(ilDispatch)+1,x
+			pha
+			lda segbeg(ilDispatch),x
+			pha
+			rts
+
+; this macro:
+; - enters a control branch opcode into the interpreter
+; - enters a relative branch destination into the intepreter
+
+branch		macro ?type, ?dest
+			
+			byte ?type
+			rbyte ?dest
+			
+			endm
+			
+; it turns out that not all branches are within range of a signed byte...
+
+lbranch		macro ?type, ?dest
+
+			revword  ?type + ((?dest - * - 2 ) & $1FF)
+
+			endm
+			
+; this macro:
+; if ?name is EOL:
+; - enters a TSTE opcode into the interpreter
+; - enters a relative branch destination into the interpreter
+; otherwise (the normal case):
+; - enters a TEST opcode into the interpreter
+; - enters a relative branch destination into the interpreter
+; - enters a BASIC keyword into the interpreter with last char's MSB set
+
+keyword		macro ?name, ?nomatch
+
+			if ?name != "EOL"
+
+			branch	TEST, ?nomatch
+			string 	mid$(?name, 1, len(?name)-1), ord(mid$(?name,-1)) + $80
+			
+			else
+			
+			branch	TSTE, ?nomatch
+			
+			endif
+			
+			endm
+
+; the following is modelled generally on what appears in 'design_notes.txt'
+; - but it is clear that the program as presented there does not match the
+; behavior described in 'TBuserManual.txt'
+; - where they differ, if it is reasonable (ie., easy) the following attempts
+; implement what 'TBuserManual.txt' describes
+; - (speculation: differences persisted because it is so hard to modify the
+; interpreter program when it is presented simply as an impenetrable block
+; of binary data)
+
+		
+			; control section
+
+ilStart		byte 	INIT
+			
+			; immediate mode
+
+ilc1		byte 	NWLN
+			byte 	GTLN
+			branch	TSTL, ilXec
+			byte	ISRT
+			lbranch	JUMP, ilc1
+			
+		; set up to execute statement
+
+ilXec		byte 	XNIT
+		
+		; statement execution
+		
+ilStmt
+
+		; "GOTO"
+
+ +			keyword "GOTO", +		
+			lbranch	CALL, ilExpr
+			byte 	DONE
+			byte 	XFER
+			
+		; "GOSUB"
+			
+ +			keyword "GOSUB", +
+			lbranch	CALL, ilExpr
+			byte 	DONE
+			byte	SAVE
+			byte 	XFER
+
+		; "PRINT"
+			
+ +			keyword "PRINT", +
+ 			
+			keyword "EOL", ilpr2
+ilpr1		byte	DONE
+			byte	NWLN
+			byte	NEXT
+			
+ilpr2		keyword "\"", ilpr6
+			byte	PSTR
+			
+ilpr3		keyword ";", ilpr4
+			lbranch JUMP, ilpr5
+			
+ilpr4		keyword ",", ilpr1
+			byte	TABC
+			
+ilpr5		keyword "EOL", ilpr2
+			byte	DONE
+			byte	NEXT
+
+ilpr6		lbranch	CALL, ilExpr
+			byte	PNUM
+			lbranch	JUMP, ilpr3
+									
+		; "IF"
+
+ +			keyword "IF", +
+			lbranch CALL, ilExpr
+			lbranch CALL, ilRelOp
+			lbranch CALL, ilExpr
+			keyword "THEN", ilESyn
+			byte 	CMPR
+			lbranch	JUMP, ilStmt
+		
+		; "INPUT"
+			
+ +			keyword	"INPUT", +
+			keyword "\"", ilin1		; is there a prompt string ?
+			byte	PSTR			; yes, print it
+			keyword ";", ilESyn		; need a following semicolon
+			
+ilin1		byte	TSTV, ilESyn	; require variable name
+			byte	INPB
+			lbranch CALL, ilExpr	; evaluate expression
+			byte	STOR			; save to variable
+			keyword ",", ilin2		; is there more ?
+			lbranch JUMP, ilin1		; b: yes, go get it
+			
+ilin2		byte	DONE			; this code might be unnecessary duplicate
+			byte	NEXT			; ...unless *insisting* these all be self-contained
+			
+		; "RETURN"
+		
+ + 			keyword "RETURN", +
+			byte 	DONE
+			byte	RSTR
+			byte	NEXT
+			
+		; "REM"
+		
+ +			keyword "REM", +
+			byte 	RMRK			; (skips to end of line and falls into NEXT)
+			
+		; "LIST"
+		
+ +			keyword "LIST", +
+			byte 	DONE
+			byte 	LIST
+			byte 	NEXT
+			
+		; "RUN"
+		
+ +			keyword "RUN", +
+			byte	DONE
+			byte 	RUNP
+			
+		; "NEW" (replaces "CLEAR")
+		
+ +			keyword "NEW", +
+			byte 	DONE
+			lbranch JUMP, ilStart
+			
+		; "END"
+			
+ +			keyword "END", +
+			byte 	DONE
+			byte	STOP
+
+		; "LET"
+
+ +			keyword "LET", +		; if match, ignore
+ +			branch	TSTV, ilESyn	; always check for variable name
+			keyword "=", ilESyn
+			lbranch CALL, ilExpr
+			byte 	DONE
+			byte 	STOR
+			byte 	NEXT
+						
+		; syntax error
+			
+ilESyn		byte	ERR				; "syntax error"
+
+		; expression evaluation
+		
+ilExpr		keyword	"-", ilex1		; unary minus ?
+			lbranch	CALL, ilTerm
+			byte	NEGA
+			lbranch	JUMP, ilex2
+			
+ilex1		keyword "+", +			; unary plus ?
+ +			lbranch	CALL, ilTerm
+
+ilex2		keyword "+", +			; binary plus ?
+			lbranch	CALL, ilTerm
+			byte	ADDI
+			lbranch	JUMP, ilex2
+			
+ +			keyword "-", +			; binary minus ?
+			lbranch	CALL, ilTerm
+			byte	SUBT
+			lbranch	JUMP, ilex2
+ +			
+ 			byte	RTRN
+
+		; expression term
+		
+ilTerm		lbranch CALL, ilFact
+
+iltr1		keyword "*", +			; multiply ?
+			lbranch  CALL, ilFact
+			byte	MULT
+			lbranch	JUMP, iltr1
+			
+ +			keyword "/", +			; divide ?
+			lbranch 	CALL, ilFact
+			byte	DIVD
+			lbranch	JUMP, iltr1
+			
+ +			keyword "%", +			; remainder ?
+			lbranch	CALL, ilFact
+			byte	MODU
+			lbranch	JUMP, iltr1
+ +			
+ 			byte 	RTRN
+
+		; expression factor
+		
+ilFact		branch	TSTV, +			; variable name ?
+			byte 	LOAD
+			byte	RTRN
+			
+ +			branch	TSTN, +			; numeric literal ?
+			byte	RTRN
+			
+ +			keyword	"(", ilEsyn		; sub-expression ?
+			lbranch	CALL, ilExpr
+			keyword ")", ilESyn
+			byte	RTRN
+ 		
+		; comparison operator required
+
+ilRelOp		keyword "=", ilr1
+			byte	LITB
+			byte 	cmpEqu
+			byte 	RTRN
+			
+ilr1		keyword "<", ilr4
+			keyword "=", ilr2
+			byte	LITB
+			byte	cmpLes | cmpEqu
+			byte	RTRN
+			
+ilr2		keyword ">", ilr3
+			byte	LITB
+			byte	cmpGrt | cmpLes
+			byte	RTRN
+			
+ilr3		byte	LITB
+			byte	cmpLes
+			byte	RTRN
+			
+ilr4		keyword ">", ilESyn
+			keyword "=", ilr5
+			byte	LITB
+			byte	cmpGrt | cmpEqu
+			byte	RTRN
+			
+ilr5		byte	LITB
+			byte	cmpGrt
+			byte	RTRN
+			
+			ends
