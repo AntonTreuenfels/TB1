@@ -41,7 +41,7 @@ Additionally, no consideration is given to portability of the source code. It is
 
 One feature in particular, segmentation of the source code, allows the separation of the logical arrangement of the source code from the physical arrangement of the object code. This makes it possible, for instance, for HXA to assign token values to the “opcodes” of the inner interpreter automatically. What they actually are is usually of no real consequence to the operation of the inner interpreter, thus there is no need for the programmer to know what they are or to manage all their details (the only exceptions are for the CALL and JUMP opcodes. Even here the tweaking is only minor in order to give them a range of -255..+255, enough to reach every part of the inner interpreter).
 
-The source code provided produces a 16K ROM image meant to be used with the Symon memory map of Seth Morabito's Symon NMOS 6502-simulator. Although TB1 itself is only a little over 2K of code, Symon proved to be a very convenient test bed during its development.
+The source code provided produces a 16K ROM image meant to be used with the Symon memory map of Seth Morabito's [Symon](https://github.com/sethm/symon) NMOS 6502-simulator. Although TB1 itself is only a little over 2K of code, Symon proved to be a very convenient test bed during its development.
 
 A main drawback, both in Symon and TB1 itself, is an inability to save or load a BASIC program. This  limits testing to short programs that can be easily typed in. This means testing of TB1 may not be as consistent or thorough as desirable.
 
