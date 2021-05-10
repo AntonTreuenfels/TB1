@@ -3,7 +3,7 @@ TB1 – A 6502 Implementation of Tiny BASIC
 by Anton Treuenfels
 October 2020
 
-TB1 is a lightly extended version of Tiny BASIC based on the orignal design described by Dennis Allison.
+TB1 is a lightly extended version of Tiny BASIC based on the [orignal design](http://www.ittybittycomputers.com/IttyBitty/TinyBasic/DDJ1/Design.html) described by Dennis Allison.
 
 Extensions and Modifications
 
